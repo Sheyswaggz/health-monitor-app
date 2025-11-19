@@ -1,0 +1,372 @@
+name: Deploy to Kubernetes
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+      short-sha: ${{ steps.vars.outputs.short-sha }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set variables
+        id: vars
+        run: |
+          echo "short-sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "branch=${GITHUB_REF#refs/heads/}" >> $GITHUB_OUTPUT
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=health-tracker
+            org.opencontainers.image.description=Health monitoring application
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+      
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          retention-days: 30
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/develop'
+    
+    environment:
+      name: staging
+      url: https://staging.health-tracker.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+      
+      - name: Update ConfigMap
+        run: |
+          kubectl apply -f k8s/configmap.yaml -n staging
+      
+      - name: Deploy to staging namespace
+        run: |
+          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:develop-${{ needs.build-and-push.outputs.short-sha }}"
+          
+          kubectl set image deployment/health-tracker-deployment \
+            health-tracker=$IMAGE_TAG \
+            -n staging \
+            --record
+          
+          kubectl annotate deployment/health-tracker-deployment \
+            kubernetes.io/change-cause="Deploy commit ${{ github.sha }} to staging" \
+            -n staging \
+            --overwrite
+      
+      - name: Wait for rollout completion
+        run: |
+          kubectl rollout status deployment/health-tracker-deployment \
+            -n staging \
+            --timeout=10m
+      
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n staging -l app=health-tracker
+          kubectl get svc -n staging -l app=health-tracker
+      
+      - name: Run smoke tests
+        run: |
+          for i in {1..30}; do
+            POD_NAME=$(kubectl get pods -n staging -l app=health-tracker -o jsonpath='{.items[0].metadata.name}')
+            STATUS=$(kubectl exec -n staging $POD_NAME -- wget -q -O- http://localhost:3000/health 2>&1 | grep -o '"status":"healthy"' || echo "")
+            
+            if [ ! -z "$STATUS" ]; then
+              echo "Smoke test passed - application is healthy"
+              exit 0
+            fi
+            
+            echo "Attempt $i: Waiting for application to be ready..."
+            sleep 10
+          done
+          
+          echo "Smoke test failed - application did not become healthy"
+          exit 1
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed, initiating rollback..."
+          kubectl rollout undo deployment/health-tracker-deployment -n staging
+          kubectl rollout status deployment/health-tracker-deployment -n staging --timeout=5m
+          echo "Rollback completed"
+
+  deploy-production:
+    name: Deploy to Production (Blue-Green)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    
+    environment:
+      name: production
+      url: https://health-tracker.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+      
+      - name: Determine deployment colors
+        id: colors
+        run: |
+          ACTIVE_COLOR=$(kubectl get svc health-tracker-service -n production -o jsonpath='{.spec.selector.color}' 2>/dev/null || echo "blue")
+          
+          if [ "$ACTIVE_COLOR" == "blue" ]; then
+            NEW_COLOR="green"
+          else
+            NEW_COLOR="blue"
+          fi
+          
+          echo "active-color=$ACTIVE_COLOR" >> $GITHUB_OUTPUT
+          echo "new-color=$NEW_COLOR" >> $GITHUB_OUTPUT
+          
+          echo "Current active deployment: $ACTIVE_COLOR"
+          echo "Deploying to: $NEW_COLOR"
+      
+      - name: Update ConfigMap
+        run: |
+          kubectl apply -f k8s/configmap.yaml -n production
+      
+      - name: Deploy to green environment
+        run: |
+          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ needs.build-and-push.outputs.short-sha }}"
+          NEW_COLOR="${{ steps.colors.outputs.new-color }}"
+          
+          kubectl get deployment health-tracker-deployment-$NEW_COLOR -n production >/dev/null 2>&1 || \
+            kubectl create deployment health-tracker-deployment-$NEW_COLOR \
+              --image=$IMAGE_TAG \
+              -n production
+          
+          kubectl set image deployment/health-tracker-deployment-$NEW_COLOR \
+            health-tracker=$IMAGE_TAG \
+            -n production \
+            --record
+          
+          kubectl label deployment/health-tracker-deployment-$NEW_COLOR \
+            app=health-tracker \
+            color=$NEW_COLOR \
+            version=v1.0.0 \
+            -n production \
+            --overwrite
+          
+          kubectl annotate deployment/health-tracker-deployment-$NEW_COLOR \
+            kubernetes.io/change-cause="Blue-green deploy commit ${{ github.sha }} to $NEW_COLOR" \
+            -n production \
+            --overwrite
+          
+          kubectl scale deployment/health-tracker-deployment-$NEW_COLOR \
+            --replicas=3 \
+            -n production
+      
+      - name: Wait for green deployment
+        run: |
+          NEW_COLOR="${{ steps.colors.outputs.new-color }}"
+          kubectl rollout status deployment/health-tracker-deployment-$NEW_COLOR \
+            -n production \
+            --timeout=15m
+      
+      - name: Run production smoke tests on green
+        run: |
+          NEW_COLOR="${{ steps.colors.outputs.new-color }}"
+          
+          for i in {1..30}; do
+            POD_NAME=$(kubectl get pods -n production -l app=health-tracker,color=$NEW_COLOR -o jsonpath='{.items[0].metadata.name}')
+            
+            if [ -z "$POD_NAME" ]; then
+              echo "No pods found for $NEW_COLOR deployment"
+              sleep 10
+              continue
+            fi
+            
+            STATUS=$(kubectl exec -n production $POD_NAME -- wget -q -O- http://localhost:3000/health 2>&1 | grep -o '"status":"healthy"' || echo "")
+            
+            if [ ! -z "$STATUS" ]; then
+              echo "Smoke test passed on $NEW_COLOR environment"
+              exit 0
+            fi
+            
+            echo "Attempt $i: Waiting for $NEW_COLOR environment to be ready..."
+            sleep 10
+          done
+          
+          echo "Smoke test failed on $NEW_COLOR environment"
+          exit 1
+      
+      - name: Switch traffic to green
+        run: |
+          NEW_COLOR="${{ steps.colors.outputs.new-color }}"
+          
+          kubectl patch svc health-tracker-service -n production \
+            -p "{\"spec\":{\"selector\":{\"app\":\"health-tracker\",\"color\":\"$NEW_COLOR\"}}}"
+          
+          echo "Traffic switched to $NEW_COLOR deployment"
+      
+      - name: Monitor production deployment
+        run: |
+          echo "Monitoring production deployment for 120 seconds..."
+          sleep 120
+          
+          for i in {1..10}; do
+            PODS=$(kubectl get pods -n production -l app=health-tracker,color=${{ steps.colors.outputs.new-color }} -o jsonpath='{.items[*].metadata.name}')
+            
+            for POD in $PODS; do
+              STATUS=$(kubectl exec -n production $POD -- wget -q -O- http://localhost:3000/health 2>&1 | grep -o '"status":"healthy"' || echo "")
+              
+              if [ -z "$STATUS" ]; then
+                echo "Health check failed for pod $POD"
+                exit 1
+              fi
+            done
+            
+            echo "Health check $i passed for all pods"
+            sleep 10
+          done
+          
+          echo "Production deployment monitoring completed successfully"
+      
+      - name: Scale down blue deployment
+        if: success()
+        run: |
+          ACTIVE_COLOR="${{ steps.colors.outputs.active-color }}"
+          
+          kubectl scale deployment/health-tracker-deployment-$ACTIVE_COLOR \
+            --replicas=0 \
+            -n production || true
+          
+          echo "Scaled down $ACTIVE_COLOR deployment"
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          ACTIVE_COLOR="${{ steps.colors.outputs.active-color }}"
+          NEW_COLOR="${{ steps.colors.outputs.new-color }}"
+          
+          echo "Production deployment failed, initiating rollback..."
+          
+          kubectl patch svc health-tracker-service -n production \
+            -p "{\"spec\":{\"selector\":{\"app\":\"health-tracker\",\"color\":\"$ACTIVE_COLOR\"}}}"
+          
+          kubectl scale deployment/health-tracker-deployment-$NEW_COLOR \
+            --replicas=0 \
+            -n production || true
+          
+          echo "Rolled back to $ACTIVE_COLOR deployment"
+      
+      - name: Create GitHub release
+        if: success()
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v1.0.0-${{ needs.build-and-push.outputs.short-sha }}
+          release_name: Production Release v1.0.0-${{ needs.build-and-push.outputs.short-sha }}
+          body: |
+            ## Production Deployment
+            
+            **Commit:** ${{ github.sha }}
+            **Image:** ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ needs.build-and-push.outputs.short-sha }}
+            **Strategy:** Blue-Green Deployment
+            **Active Color:** ${{ steps.colors.outputs.new-color }}
+            
+            ### Deployment Details
+            - Environment: Production
+            - Replicas: 3
+            - Namespace: production
+            - Service: health-tracker-service
+            
+            ### Changes
+            Deployed commit ${{ github.sha }} to production using blue-green deployment strategy.
+          draft: false
+          prerelease: false
