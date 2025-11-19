@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: health-tracker-config
+  namespace: production
+  labels:
+    app: health-tracker
+    component: config
+    managed-by: gitops
+  annotations:
+    description: "Health tracker application configuration"
+data:
+  LOG_LEVEL: "info"
+  ENVIRONMENT: "production"
+  DATABASE_PATH: "/data/health.db"
+  CORS_ORIGIN: "https://health-tracker.example.com"
+  PORT: "3000"
+  NODE_ENV: "production"
+  LOG_FORMAT: "json"
